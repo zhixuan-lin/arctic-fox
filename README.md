@@ -1,4 +1,4 @@
-# Adaptive Computation Pruning (ACP)
+# Adaptive Computation Pruning (ACP) for the Forgetting Transformer
 
 Official implementation of "Adaptive Computation Pruning for the Forgetting Transformer". This implementation is a preview version and it will be integrated into the [main FoX repository](https://github.com/zhixuan-lin/forgetting-transformer) in the future.
 
