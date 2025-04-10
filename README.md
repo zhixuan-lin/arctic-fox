@@ -1,6 +1,6 @@
 # Adaptive Computation Pruning (ACP) for the Forgetting Transformer
 
-Official implementation of "Adaptive Computation Pruning for the Forgetting Transformer". This implementation is a preview version and it will be integrated into the [main FoX repository](https://github.com/zhixuan-lin/forgetting-transformer) in the future.
+Official implementation of "[Adaptive Computation Pruning for the Forgetting Transformer](https://arxiv.org/abs/2504.06949)". This implementation is a preview version and it will be integrated into the [main FoX repository](https://github.com/zhixuan-lin/forgetting-transformer) in the future.
 
 ## Dependencies
 
@@ -84,3 +84,15 @@ assert out.size() == (batch_size, seq_len, num_heads, head_dim)
 
 ```
 
+## Citation
+
+If you use this code, please consider citing the following:
+
+```
+@article{lin2025adaptive,
+  title={Adaptive Computation Pruning for the Forgetting Transformer},
+  author={Lin, Zhixuan and Obando-Ceron, Johan and He, Xu Owen and Courville, Aaron},
+  journal={arXiv preprint arXiv:2504.06949},
+  year={2025}
+}
+```
