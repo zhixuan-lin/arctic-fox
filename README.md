@@ -60,17 +60,19 @@ class GroupRMSNorm(nn.Module):
         out = out.to(x.dtype)
         return out
 
+# Apply QK-norm
+q_norm = GroupRMSNorm(hidden_size=num_heads * head_dim, num_groups=num_heads).to(device)
+k_norm = GroupRMSNorm(hidden_size=num_heads * head_dim, num_groups=num_heads).to(device)
+q, k = [rearrange(entry, '... h d -> ... (h d)') for entry in (q, k)]
+q = q_norm(q)
+k = k_norm(k)
+q, k = [rearrange(entry, '... (h d) -> ... h d', h=num_heads) for entry in (q, k)]
+
 # exp(log_epsilon) bounds the maximum total attention weights that could be pruned
 log_epsilon = -10
 
 with torch.no_grad():
-    # Calculate upper bounds of attention logits
-    q_norm = GroupRMSNorm(hidden_size=num_heads * head_dim, num_groups=num_heads).to(device)
-    k_norm = GroupRMSNorm(hidden_size=num_heads * head_dim, num_groups=num_heads).to(device)
-    q, k = [rearrange(entry, '... h d -> ... (h d)') for entry in (q, k)]
-    q = q_norm(q)
-    k = k_norm(k)
-    q, k = [rearrange(entry, '... (h d) -> ... h d', h=num_heads) for entry in (q, k)]
+    # Calculate an upper bound of attention logits
     # If we use QK-norm, it is easily to get an upper bound of q/k L2-norm
     max_q_norm = q_norm.weight.view(num_heads, head_dim).abs().max(dim=-1).values * math.sqrt(head_dim)
     max_k_norm = k_norm.weight.view(num_heads, head_dim).abs().max(dim=-1).values * math.sqrt(head_dim)
