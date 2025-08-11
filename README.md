@@ -1,6 +1,8 @@
 # Adaptive Computation Pruning (ACP) for the Forgetting Transformer
 
-Official implementation of "[Adaptive Computation Pruning for the Forgetting Transformer](https://arxiv.org/abs/2504.06949)". This implementation is a preview version and it will be integrated into the [main FoX repository](https://github.com/zhixuan-lin/forgetting-transformer) in the future.
+## Deprecation Notice
+
+This repo has been deprecated; please use the implementation in the official [Forgetting Transformer repo](https://github.com/zhixuan-lin/forgetting-transformer) instead.
 
 ## Dependencies
 
@@ -13,7 +15,7 @@ pip install torch==2.4.0  # This also installs triton==3.0.0
 
 ## Usage
 
-The core API change compared to the original Forgetting Attention kernel is the `adaptive_threshold` argument, which corresponds to the $\delta$ threshold in the paper. Here is an example demonstrating how you should set the threshold.  You can read the paper to understand the rationale behind it. Note currently we only support dynamicaly setting the threshold for models that use QK-norm. Support for models without QK-norm will be added after further experiments.
+It is highly recommended you use Forgetting Attention with Adaptive Computation Pruning, especially for long-context pretraining. The core API change compared to the original Forgetting Attention kernel is the `adaptive_threshold` argument, which corresponds to the $\delta$ threshold in the paper. Here is an example demonstrating how you should set the threshold, depending on whether QK-norm is used:
 
 ```python
 import torch
@@ -41,49 +43,56 @@ fgate_logit = torch.randn((batch_size, seq_len, num_heads), dtype=dtype, device=
 log_fgate = torch.nn.functional.logsigmoid(fgate_logit.float())
 
 
-class GroupRMSNorm(nn.Module):
-    """Naive implementation of grouped RMSNorm"""
-    def __init__(self, hidden_size: int, num_groups: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.hidden_size = hidden_size
-        self.num_groups = num_groups
-        self.eps = eps
+USE_QK_NORM = False
+if USE_QK_NORM:
+    class GroupRMSNorm(nn.Module):
+        """Naive implementation of grouped RMSNorm"""
+        def __init__(self, hidden_size: int, num_groups: int, eps: float = 1e-6):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(hidden_size))
+            self.hidden_size = hidden_size
+            self.num_groups = num_groups
+            self.eps = eps
 
-    def forward(self, x):
-        assert x.size(-1) == self.hidden_size, x.size(-1)
-        x = rearrange(x, '... (g d) -> ... g d', g=self.num_groups)
-        weight = rearrange(self.weight, '(g d) -> g d', g=self.num_groups)
-        rstd = x.float().square().mean(dim=-1, keepdim=True).sqrt()
-        out = x / rstd * weight
-        out = rearrange(out, '... g d -> ... (g d)')
-        out = out.to(x.dtype)
-        return out
+        def forward(self, x):
+            assert x.size(-1) == self.hidden_size, x.size(-1)
+            x = rearrange(x, '... (g d) -> ... g d', g=self.num_groups)
+            weight = rearrange(self.weight, '(g d) -> g d', g=self.num_groups)
+            rstd = x.float().square().mean(dim=-1, keepdim=True).sqrt()
+            out = x / rstd * weight
+            out = rearrange(out, '... g d -> ... (g d)')
+            out = out.to(x.dtype)
+            return out
 
-# Apply QK-norm
-q_norm = GroupRMSNorm(hidden_size=num_heads * head_dim, num_groups=num_heads).to(device)
-k_norm = GroupRMSNorm(hidden_size=num_heads * head_dim, num_groups=num_heads).to(device)
-q, k = [rearrange(entry, '... h d -> ... (h d)') for entry in (q, k)]
-q = q_norm(q)
-k = k_norm(k)
-q, k = [rearrange(entry, '... (h d) -> ... h d', h=num_heads) for entry in (q, k)]
+    # Apply QK-norm
+    q_norm = GroupRMSNorm(hidden_size=num_heads * head_dim, num_groups=num_heads).to(device)
+    k_norm = GroupRMSNorm(hidden_size=num_heads * head_dim, num_groups=num_heads).to(device)
+    q, k = [rearrange(entry, '... h d -> ... (h d)') for entry in (q, k)]
+    q = q_norm(q)
+    k = k_norm(k)
+    q, k = [rearrange(entry, '... (h d) -> ... h d', h=num_heads) for entry in (q, k)]
 
-# exp(log_epsilon) bounds the maximum total attention weights that could be pruned
-log_epsilon = -10
+# exp(log_pruning_tolerance) bounds the maximum total attention weights that could be pruned
+log_pruning_tolerance = -10.0
 
 with torch.no_grad():
     # Calculate an upper bound of attention logits
-    # If we use QK-norm, it is easily to get an upper bound of q/k L2-norm
-    max_q_norm = q_norm.weight.view(num_heads, head_dim).abs().max(dim=-1).values * math.sqrt(head_dim)
-    max_k_norm = k_norm.weight.view(num_heads, head_dim).abs().max(dim=-1).values * math.sqrt(head_dim)
+    if USE_QK_NORM:
+        # If we use QK-norm, it is easily to get an upper bound of q/k L2-norm
+        max_q_norm = q_norm.weight.view(num_heads, head_dim).abs().max(dim=-1).values * math.sqrt(head_dim)
+        max_k_norm = k_norm.weight.view(num_heads, head_dim).abs().max(dim=-1).values * math.sqrt(head_dim)
+    else:
+        # Otherwise we could calculate the max L2 norms manually 
+        max_q_norm = torch.linalg.vector_norm(q, dim=-1).max(dim=-2).values
+        max_k_norm = torch.linalg.vector_norm(k, dim=-1).max(dim=-2).values
+        assert max_q_norm.size() == max_k_norm.size() == (batch_size, num_heads)
 
     logit_upper_bound = max_q_norm * max_k_norm / math.sqrt(head_dim)
-    adaptive_threshold = -(2 * logit_upper_bound + math.log(seq_len)) + log_epsilon
+    adaptive_threshold = -(2 * logit_upper_bound + math.log(seq_len)) + log_pruning_tolerance
 
 
 out = forgetting_attention(q, k, v, log_fgate, adaptive_threshold=adaptive_threshold)
 assert out.size() == (batch_size, seq_len, num_heads, head_dim)
-
 ```
 
 ## Citation
@@ -91,10 +100,12 @@ assert out.size() == (batch_size, seq_len, num_heads, head_dim)
 If you use this code, please consider citing the following:
 
 ```
-@article{lin2025adaptive,
-  title={Adaptive Computation Pruning for the Forgetting Transformer},
-  author={Lin, Zhixuan and Obando-Ceron, Johan and He, Xu Owen and Courville, Aaron},
-  journal={arXiv preprint arXiv:2504.06949},
-  year={2025}
+@inproceedings{
+lin2025adaptive,
+title={Adaptive Computation Pruning for the Forgetting Transformer},
+author={Zhixuan Lin and Johan Obando-Ceron and Xu He and Aaron Courville},
+booktitle={Second Conference on Language Modeling},
+year={2025},
+url={https://openreview.net/forum?id=xNj14CY5S1}
 }
 ```

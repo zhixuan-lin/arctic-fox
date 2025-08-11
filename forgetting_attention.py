@@ -25,7 +25,8 @@ import torch
 import triton
 import triton.language as tl
 from einops import rearrange
-from typing import Optional
+from typing import Optional, Union, Tuple
+from collections import defaultdict
 
 
 __all__ = ["forgetting_attention"]
@@ -42,8 +43,39 @@ def rounded_multiple(a, b):
 
 # --------------------------- public API ---------------------------
 class ForgettingAttention(torch.autograd.Function):
+    events = defaultdict(lambda: {
+        "fwd_start_event": torch.cuda.Event(enable_timing=True),
+        "fwd_end_event": torch.cuda.Event(enable_timing=True),
+        "bwd_start_event": torch.cuda.Event(enable_timing=True),
+        "bwd_end_event": torch.cuda.Event(enable_timing=True),
+
+        "fwd_find_index_start_event": torch.cuda.Event(enable_timing=True),
+        "fwd_find_index_end_event": torch.cuda.Event(enable_timing=True),
+        "bwd_find_index_kv_start_event": torch.cuda.Event(enable_timing=True),
+        "bwd_find_index_kv_end_event": torch.cuda.Event(enable_timing=True),
+        "bwd_find_index_q_start_event": torch.cuda.Event(enable_timing=True),
+        "bwd_find_index_q_end_event": torch.cuda.Event(enable_timing=True),
+    })
+    info = defaultdict(lambda: {
+        "fwd_time": 0.0,
+        "fwd_count": 0,
+        "bwd_time": 0.0,
+        "bwd_count": 0,
+
+        "fwd_find_index_time": 0.0,
+        "fwd_find_index_count": 0,
+        "bwd_find_index_kv_time": 0.0,
+        "bwd_find_index_kv_count": 0,
+        "bwd_find_index_q_time": 0.0,
+        "bwd_find_index_q_count": 0,
+    })
+
     @staticmethod
-    def forward(ctx, q, k, v, log_fgate, seq_start, causal, sm_scale, adaptive_threshold, return_log_normalizer, return_start_index):
+    def forward(ctx, q, k, v, log_fgate, seq_start, causal, sm_scale, adaptive_threshold, return_log_normalizer, return_start_index, record_time_key, record_attention_time, record_find_index_time):
+        if record_attention_time:
+            ForgettingAttention.events[record_time_key]["fwd_start_event"].record()
+
+
         assert causal, "Only causal attention is supported"
         Dq, Dk, Dv = q.shape[-1], k.shape[-1], v.shape[-1]
         assert Dq == Dk == Dv, "feature size of q, k, v should be equal"
@@ -54,9 +86,11 @@ class ForgettingAttention(torch.autograd.Function):
 
         if adaptive_threshold is not None:
             adaptive_threshold = torch.as_tensor(adaptive_threshold, dtype=torch.float, device=q.device)
-            if adaptive_threshold.size() == ():
-                adaptive_threshold = adaptive_threshold.expand(H).clone()
-            assert adaptive_threshold.size() == (H,), "adaptive_threshold must be a scalar or has shape (num_heads,)"
+            try:
+                adaptive_threshold = torch.broadcast_to(adaptive_threshold, (B, H))
+            except RuntimeError:
+                raise RuntimeError(f"adaptive_threshold must be broadcastable to (batch_size, num_heads) = ({B}, {H}), but got {adaptive_threshold.size()}.")
+            assert adaptive_threshold.size() == (B, H)
 
         if seq_start is not None:
             has_seq_start = True
@@ -99,8 +133,12 @@ class ForgettingAttention(torch.autograd.Function):
 
         with torch.cuda.device(device):
 
-            config = get_fwd_config(B, H, M, N, D, causal)
-            BLOCK_M, BLOCK_N, num_stages, num_warps = config
+            if M > 1:
+                config = get_fwd_config(B, H, M, N, D, causal)
+                BLOCK_M, BLOCK_N, num_stages, num_warps = config
+            else:
+                BLOCK_N, num_stages, num_warps = min(128, max(16, triton.next_power_of_2(N))), 1, 4
+                BLOCK_M = 1
 
             divisible_m = M % BLOCK_M == 0
             divisible_n = N % BLOCK_N == 0
@@ -109,17 +147,26 @@ class ForgettingAttention(torch.autograd.Function):
             start_index = torch.empty((B, H, triton.cdiv(M, BLOCK_M)), dtype=torch.long, device=q.device)
             if adaptive_threshold is not None:
                 grid = (H, B)
+                if record_find_index_time:
+                    ForgettingAttention.events[record_time_key]["fwd_find_index_start_event"].record()
                 _find_start_index_kernel[grid](
                     log_lambda,
                     start_index,
                     adaptive_threshold,
                     log_lambda.stride(0), log_lambda.stride(1), log_lambda.stride(2),
                     start_index.stride(0), start_index.stride(1), start_index.stride(2),
+                    adaptive_threshold.stride(0), adaptive_threshold.stride(1),
                     B, H, M, N, P_SEQ,
                     BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
                     DIVISIBLE_M=divisible_m, DIVISIBLE_N=divisible_n,
                     num_warps=1
                 )
+                if record_find_index_time:
+                    ForgettingAttention.events[record_time_key]["fwd_find_index_end_event"].record()
+                    torch.cuda.synchronize()
+                    elapsed = ForgettingAttention.events[record_time_key]["fwd_find_index_start_event"].elapsed_time(ForgettingAttention.events[record_time_key]["fwd_find_index_end_event"])
+                    ForgettingAttention.info[record_time_key]["fwd_find_index_time"] += elapsed
+                    ForgettingAttention.info[record_time_key]["fwd_find_index_count"] += 1
 
             # Actual forward
             # consider using 3d grid to avoid div & rem
@@ -149,8 +196,18 @@ class ForgettingAttention(torch.autograd.Function):
         ctx.sm_scale = sm_scale
         ctx.causal = causal
         ctx.has_seq_start = has_seq_start
+        ctx.record_time_key = record_time_key
+        ctx.record_attention_time = record_attention_time
+        ctx.record_find_index_time = record_find_index_time
 
         has_extra_return = return_log_normalizer or return_start_index
+
+        if record_attention_time:
+            ForgettingAttention.events[record_time_key]["fwd_end_event"].record()
+            torch.cuda.synchronize()
+            elapsed = ForgettingAttention.events[record_time_key]["fwd_start_event"].elapsed_time(ForgettingAttention.events[record_time_key]["fwd_end_event"])
+            ForgettingAttention.info[record_time_key]["fwd_time"] += elapsed
+            ForgettingAttention.info[record_time_key]["fwd_count"] += 1
         if has_extra_return:
             outs = (
                 o,
@@ -162,6 +219,9 @@ class ForgettingAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do, *ignored):
+        if ctx.record_attention_time:
+            ForgettingAttention.events[ctx.record_time_key]["bwd_start_event"].record()
+
         q, k, v, o, L, log_lambda, seq_start, adaptive_threshold = ctx.saved_tensors
         sm_scale = ctx.sm_scale
         causal = ctx.causal
@@ -212,17 +272,26 @@ class ForgettingAttention(torch.autograd.Function):
             end_index = torch.empty((B, H, triton.cdiv(N, BLOCK_N)), dtype=torch.long, device=q.device)
             if adaptive_threshold is not None:
                 grid = (H, B)
+                if ctx.record_find_index_time:
+                    ForgettingAttention.events[ctx.record_time_key]["bwd_find_index_kv_start_event"].record()
                 _find_end_index_kernel[grid](
                     log_lambda,
                     end_index,
                     adaptive_threshold,
                     log_lambda.stride(0), log_lambda.stride(1), log_lambda.stride(2),
                     end_index.stride(0), end_index.stride(1), end_index.stride(2),
+                    adaptive_threshold.stride(0), adaptive_threshold.stride(1),
                     B, H, M, N, P_SEQ,
                     BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
                     DIVISIBLE_M=divisible_m, DIVISIBLE_N=divisible_n,
                     num_warps=1
                 )
+                if ctx.record_find_index_time:
+                    ForgettingAttention.events[ctx.record_time_key]["bwd_find_index_kv_end_event"].record()
+                    torch.cuda.synchronize()
+                    elapsed = ForgettingAttention.events[ctx.record_time_key]["bwd_find_index_kv_start_event"].elapsed_time(ForgettingAttention.events[ctx.record_time_key]["bwd_find_index_kv_end_event"])
+                    ForgettingAttention.info[ctx.record_time_key]["bwd_find_index_kv_time"] += elapsed
+                    ForgettingAttention.info[ctx.record_time_key]["bwd_find_index_kv_count"] += 1
             # dk = torch.empty((B, H, N, D), dtype=k.dtype, device=q.device)
             # dv = torch.empty((B, H, N, D), dtype=v.dtype, device=q.device)
             dk = torch.empty_like(k)
@@ -260,17 +329,26 @@ class ForgettingAttention(torch.autograd.Function):
             start_index = torch.empty((B, H, triton.cdiv(M, BLOCK_M)), dtype=torch.long, device=q.device)
             if adaptive_threshold is not None:
                 grid = (H, B)
+                if ctx.record_find_index_time:
+                    ForgettingAttention.events[ctx.record_time_key]["bwd_find_index_q_start_event"].record()
                 _find_start_index_kernel[grid](
                     log_lambda,
                     start_index,
                     adaptive_threshold,
                     log_lambda.stride(0), log_lambda.stride(1), log_lambda.stride(2),
                     start_index.stride(0), start_index.stride(1), start_index.stride(2),
+                    adaptive_threshold.stride(0), adaptive_threshold.stride(1),
                     B, H, M, N, P_SEQ,
                     BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
                     DIVISIBLE_M=divisible_m, DIVISIBLE_N=divisible_n,
                     num_warps=1
                 )
+                if ctx.record_find_index_time:
+                    ForgettingAttention.events[ctx.record_time_key]["bwd_find_index_q_end_event"].record()
+                    torch.cuda.synchronize()
+                    elapsed = ForgettingAttention.events[ctx.record_time_key]["bwd_find_index_q_start_event"].elapsed_time(ForgettingAttention.events[ctx.record_time_key]["bwd_find_index_q_end_event"])
+                    ForgettingAttention.info[ctx.record_time_key]["bwd_find_index_q_time"] += elapsed
+                    ForgettingAttention.info[ctx.record_time_key]["bwd_find_index_q_count"] += 1
 
             # grid = (triton.cdiv(M, BLOCK_M), H, B)
             grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]), H, B)
@@ -300,7 +378,14 @@ class ForgettingAttention(torch.autograd.Function):
         dcumsum = torch.cumsum(dlog_lambda, dim=-1, dtype=log_lambda.dtype)
         dlog_fgate = dlog_lambda + dcumsum[..., -1:] - dcumsum
         dlog_fgate = dlog_fgate.float()
-        return dq, dk, dv, dlog_fgate, None, None, None, None, None, None, None
+
+        if ctx.record_attention_time:
+            ForgettingAttention.events[ctx.record_time_key]["bwd_end_event"].record()
+            torch.cuda.synchronize()
+            elapsed = ForgettingAttention.events[ctx.record_time_key]["bwd_start_event"].elapsed_time(ForgettingAttention.events[ctx.record_time_key]["bwd_end_event"])
+            ForgettingAttention.info[ctx.record_time_key]["bwd_time"] += elapsed
+            ForgettingAttention.info[ctx.record_time_key]["bwd_count"] += 1
+        return dq, dk, dv, dlog_fgate, None, None, None, None, None, None, None, None, None
 
 
 def forgetting_attention(
@@ -312,8 +397,7 @@ def forgetting_attention(
     head_first: bool = False,
     seq_start: Optional[torch.Tensor] = None,
     sm_scale: Optional[float] = None,
-    adaptive_threshold: Optional[float] = None,
-    return_start_index: bool = False
+    adaptive_threshold: Optional[Union[float, torch.Tensor]] = None,
 ):
     """
     A FlashAttention-based implementation of Forgetting Attention. 
@@ -332,7 +416,7 @@ def forgetting_attention(
         - v: (batch_size, seqlen_k, num_heads, head_dim) unless head_first=True.
         - log_fgate: (batch_size, seqlen_k, num_heads) unless head_first=True. 
               This should be the **log** of the forget gates. This is typically the 
-              output of torch.nn.functional.log_sigmoid.
+              output of torch.nn.functional.logsigmoid.
         - head_first: if True, the order the num_heads and seqlen_* axis of the all 
               FloatTensor inputs and outputs should be (num_heads, seq_len_*) instead of
               (seq_len_*, num_heads)
@@ -342,14 +426,16 @@ def forgetting_attention(
               This is useful for left-padded inputs.
         - sm_scale: The scaling of attention scores before applying softmax. If
               None, it defaults to (1.0 / math.sqrt(head_dim))
+        - adaptive_threshold: The threshold for adaptive computation pruning. Must be
+              broadcastable to (batch_size, num_heads)
 
     Returns:
-        out (torch.Tensor): (batch_size, num_heads, seqlen_q, head_dim) unless head_first=True.
+        out (torch.Tensor): (batch_size, seqlen_q, num_heads, head_dim) unless head_first=True.
     """
     if not head_first:
         q, k, v = [rearrange(item, "b t h d -> b h t d") for item in (q, k, v)]
         log_fgate = rearrange(log_fgate, "b t h -> b h t")
-    out = ForgettingAttention.apply(q, k, v, log_fgate, seq_start, True, sm_scale, adaptive_threshold, False, return_start_index)
+    out = ForgettingAttention.apply(q, k, v, log_fgate, seq_start, True, sm_scale, adaptive_threshold, False, False, None, False, False)
     if not head_first:
         out = rearrange(out, "b h t d -> b t h d")
     return out
@@ -388,7 +474,8 @@ def get_fwd_config(B, H, M, N, D, causal):
         else:
             BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
     else:
-        BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
+        raise ValueError(f"Unsupported device capability {torch.cuda.get_device_capability()}. Please open an issue.")
+        # BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
     return (BLOCK_M, BLOCK_N, num_stages, num_warps)
 
 # @triton.autotune(
@@ -533,7 +620,11 @@ def _fwd_kernel(
 
         # -- compute qk ---
         # s = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        s = tl.dot(q, k, input_precision="ieee") * qk_scale
+        if BLOCK_M > 1:
+            s = tl.dot(q, k, input_precision="ieee") * qk_scale
+        else:
+            # (1, D), (D, T)
+            s = tl.sum((q.T * k).to(tl.float32), axis=0, keep_dims=True) * qk_scale
         decay_bias = log_lambda_out[:, None] - log_lambda_in[None, :]
         s += decay_bias * log2e
 
@@ -557,7 +648,10 @@ def _fwd_kernel(
 
         # -- scale and update acc: acc *= alpha[:, None]--
         acc *= alpha[:, None]
-        acc += tl.dot(p.to(input_dtype), v, input_precision="ieee")
+        if BLOCK_M > 1:
+            acc += tl.dot(p.to(input_dtype), v, input_precision="ieee")
+        else:
+            acc += tl.sum(p.T * v, axis=0, keep_dims=True)
 
         # -- update m_i and l_i --
         l_i = l_i * alpha + p_sum
@@ -591,6 +685,7 @@ def _find_start_index_kernel(
     THRESHOLD,
     stride_log_lambda_z, stride_log_lambda_h, stride_log_lambda_n,
     stride_start_index_z, stride_start_index_h, stride_start_index_mb,
+    stride_threshold_z, stride_threshold_h,
     Z, H, M, N, P_SEQ,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     DIVISIBLE_M: tl.constexpr, DIVISIBLE_N: tl.constexpr,
@@ -601,7 +696,7 @@ def _find_start_index_kernel(
 
     LOG_LAMBDA += off_z * stride_log_lambda_z + off_h * stride_log_lambda_h
     START_INDEX += off_z * stride_start_index_z + off_h * stride_start_index_h
-    THRESHOLD += off_h
+    THRESHOLD += off_z * stride_threshold_z + off_h * stride_threshold_h
     start_index = 0
 
     log_lambda_out_ptr = LOG_LAMBDA + P_SEQ * stride_log_lambda_n
@@ -642,6 +737,7 @@ def _find_end_index_kernel(
     THRESHOLD,
     stride_log_lambda_z, stride_log_lambda_h, stride_log_lambda_n,
     stride_end_index_z, stride_end_index_h, stride_end_index_nb,
+    stride_threshold_z, stride_threshold_h,
     Z, H, M, N, P_SEQ,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     DIVISIBLE_M: tl.constexpr, DIVISIBLE_N: tl.constexpr,
@@ -652,7 +748,7 @@ def _find_end_index_kernel(
 
     LOG_LAMBDA += off_z * stride_log_lambda_z + off_h * stride_log_lambda_h
     END_INDEX += off_z * stride_end_index_z + off_h * stride_end_index_h
-    THRESHOLD += off_h
+    THRESHOLD += off_z * stride_threshold_z + off_h * stride_threshold_h
     end_index = 0
 
     # log_lambda_out_ptr = LOG_LAMBDA + P_SEQ * stride_log_lambda_n
@@ -748,7 +844,8 @@ def get_bwd_kv_config(B, H, M, N, D, causal):
         else:
             BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
     else:
-        BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
+        raise ValueError(f"Unsupported device capability {torch.cuda.get_device_capability()}. Please open an issue.")
+        # BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
     return (BLOCK_M, BLOCK_N, num_stages, num_warps)
 
 def get_bwd_q_config(B, H, M, N, D, causal):
@@ -774,7 +871,8 @@ def get_bwd_q_config(B, H, M, N, D, causal):
         else:
             BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 128, 2, 8
     else:
-        BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
+        raise ValueError(f"Unsupported device capability {torch.cuda.get_device_capability()}. Please open an issue.")
+        # BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
     return (BLOCK_M, BLOCK_N, num_stages, num_warps)
 
 
@@ -1308,7 +1406,7 @@ except BaseException:
     HAS_FLASH = False
 
 TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
-BATCH, N_HEADS, HEAD_DIM = 4, 32, 128
+BATCH, N_HEADS, HEAD_DIM = 4, 32, 64
 # vary seq length for fixed head and batch=4
 configs = []
 for mode in ["fwd", "bwd"]:
@@ -1359,7 +1457,9 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, dev
         #     v = v.permute(0, 1, 3, 2)
         #     v = v.to(torch.float8_e5m2)
         sm_scale = 1.3
-        fn = lambda: forgetting_attention(q, k, v, log_fgate, head_first=True, sm_scale=sm_scale, adaptive_threshold=None)
+        adaptive_threshold = torch.full((BATCH, H), fill_value=-10, dtype=torch.float, device=device)
+        # adaptive_threshold = -10
+        fn = lambda: forgetting_attention(q, k, v, log_fgate, head_first=True, sm_scale=sm_scale, adaptive_threshold=adaptive_threshold)
         if mode == "bwd":
             o = fn()
             do = torch.randn_like(o)
